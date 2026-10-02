@@ -5,9 +5,10 @@
     "batch_id": "smoke-generation-batch-1",
     "job_type": "generation",
     "primary_sample": "sample-1",
+    "primary_sample_metadata": {"projection": "equirectangular", "fov": [360, 180]},
     "source_job_id": null,
     "attempt": 1,
-    "timeout_seconds": 3600,
+    "timeout_seconds": 14400,
     "parameters": {}
   },
   "inputs": {
@@ -18,6 +19,6 @@
     }
   },
   "runtime": {
-    "output_dir": "/data/output/my-generator@0.1.0/smoke-dataset/sample-1"
+    "output_dir": "/data/output/hunyuanworld-panorama@0.1.0/smoke/sample-1"
   }
 }

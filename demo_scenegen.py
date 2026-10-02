@@ -26,7 +26,7 @@ from hy3dworld.AngelSlim.attention_quantization_processor import FluxFp8AttnProc
 class HYworldDemo:
     def __init__(self, args, seed=42):
         self.args = args
-        target_size = 3840
+        target_size = getattr(args, "mesh_width", 3840)
         kernel_scale = max(1, int(target_size / 1920))
 
         self.LayerDecomposer = LayerDecomposition(args)
@@ -40,12 +40,13 @@ class HYworldDemo:
             kernel_scale=kernel_scale,
         )
 
-        if self.args.fp8_attention:
-            self.LayerDecomposer.inpaint_fg_model.transformer.set_attn_processor(FluxFp8AttnProcessor2_0())
-            self.LayerDecomposer.inpaint_sky_model.transformer.set_attn_processor(FluxFp8AttnProcessor2_0())
-        if self.args.fp8_gemm:
-            FluxFp8GeMMProcessor(self.LayerDecomposer.inpaint_fg_model.transformer)
-            FluxFp8GeMMProcessor(self.LayerDecomposer.inpaint_sky_model.transformer)
+        for pipe in (self.LayerDecomposer.inpaint_fg_model, self.LayerDecomposer.inpaint_sky_model):
+            if pipe is None:
+                continue
+            if self.args.fp8_attention:
+                pipe.transformer.set_attn_processor(FluxFp8AttnProcessor2_0())
+            if self.args.fp8_gemm:
+                FluxFp8GeMMProcessor(pipe.transformer)
             
     def run(self, image_path, labels_fg1, labels_fg2, classes="outdoor", output_dir='output_hyworld', export_drc=False):
         # foreground layer information

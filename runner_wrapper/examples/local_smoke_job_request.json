@@ -1,0 +1,15 @@
+{
+  "contract_version": 1,
+  "job": {
+    "job_id": "hunyuanworld-local-smoke",
+    "batch_id": "hunyuanworld-local-smoke-batch",
+    "job_type": "generation",
+    "primary_sample": "sample-1",
+    "primary_sample_metadata": {"projection": "equirectangular", "fov": [360, 180]},
+    "attempt": 1,
+    "timeout_seconds": 3600,
+    "parameters": {"classes": "indoor", "mesh_width": 960, "sr_tile": 256}
+  },
+  "inputs": {"data": {"sample-1": {"image": "/data/datasets/smoke/image.png"}}},
+  "runtime": {"output_dir": "/data/output/hunyuanworld-panorama@0.1.0/smoke/sample-1"}
+}

@@ -37,7 +37,7 @@ def build_sr_model(scale=2, model_name=None, tile=0, tile_pad=10, pre_pad=0, fp3
     model = config['model']()
     file_url = [config['url']]
 
-    model_path = os.path.join(
+    model_path = os.getenv("HUNYUANWORLD_SR_WEIGHTS") or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'weights', model_name + '.pth')
     if not os.path.isfile(model_path):
         ROOT_DIR = os.path.dirname(os.path.abspath(__file__))

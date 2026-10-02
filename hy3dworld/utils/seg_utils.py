@@ -103,9 +103,10 @@ def build_gd_model(GROUNDING_MODEL, device="cuda"):
         grounding_model: Loaded model
     """
     model_id = GROUNDING_MODEL
-    processor = AutoProcessor.from_pretrained(model_id)
+    revision = os.getenv("HUNYUANWORLD_GROUNDING_REVISION")
+    processor = AutoProcessor.from_pretrained(model_id, revision=revision)
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-        model_id).to(device)
+        model_id, revision=revision).to(device)
 
     return processor, grounding_model
 

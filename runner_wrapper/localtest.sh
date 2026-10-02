@@ -15,11 +15,12 @@ IMAGE="${RUNNER_IMAGE:-${repo_name}-runner:local}"
 CONTAINER="${RUNNER_CONTAINER:-${repo_name}-runner-localtest}"
 HOST_PORT="${RUNNER_HOST_PORT:-58090}"
 DATA_DIR="${RUNNER_DATA_DIR:-${REPO_ROOT}/data}"
-RUNNER_NAME="${RUNNER_NAME:-${repo_name}-runner}"
+RUNNER_NAME="${RUNNER_NAME:-hunyuanworld-panorama}"
 RUNNER_TYPE="${RUNNER_TYPE:-generator}"
 RUNNER_VERSION="${RUNNER_VERSION:-0.1.0}"
 RUNNER_ADAPTER="${RUNNER_ADAPTER:-runner_wrapper.adapter:run_job}"
-REQUEST_FILE="${RUNNER_REQUEST_FILE:-${SCRIPT_DIR}/examples/${RUNNER_TYPE}_job_request.json}"
+REQUEST_FILE="${RUNNER_REQUEST_FILE:-${SCRIPT_DIR}/examples/local_smoke_job_request.json}"
+RUNNER_GPUS="${RUNNER_GPUS:-1}"
 
 usage() {
   cat <<EOF
@@ -42,9 +43,10 @@ Environment:
   RUNNER_ADAPTER=${RUNNER_ADAPTER}
   RUNNER_REQUEST_FILE=${REQUEST_FILE}
   RUNNER_DATA_DIR=${DATA_DIR}
+  RUNNER_GPUS=${RUNNER_GPUS}
 
-For the bundled test adapter, set TEST_RUNNER_MIN_SECONDS=0 and
-TEST_RUNNER_MAX_SECONDS=0 when you want a fast smoke run.
+Place a real 2:1 panorama at datasets/smoke/image.png in RUNNER_DATA_DIR.
+The local smoke uses the upstream indoor path at reduced mesh resolution.
 EOF
 }
 
@@ -68,22 +70,13 @@ build_image() {
 
 prepare_data() {
   mkdir -p \
-    "${DATA_DIR}/datasets/smoke" \
     "${DATA_DIR}/model_cache" \
     "${DATA_DIR}/pipelines" \
-    "${DATA_DIR}/output/my-generator@0.1.0/smoke-dataset/sample-1"
-
-  if [[ ! -f "${DATA_DIR}/datasets/smoke/image.png" ]]; then
-    printf 'smoke input\n' > "${DATA_DIR}/datasets/smoke/image.png"
-  fi
-
-  if [[ ! -f "${DATA_DIR}/datasets/smoke/reference.png" ]]; then
-    printf 'smoke reference\n' > "${DATA_DIR}/datasets/smoke/reference.png"
-  fi
-
-  if [[ ! -f "${DATA_DIR}/output/my-generator@0.1.0/smoke-dataset/sample-1/scene.glb" ]]; then
-    printf 'smoke generated scene\n' > "${DATA_DIR}/output/my-generator@0.1.0/smoke-dataset/sample-1/scene.glb"
-  fi
+    "${DATA_DIR}/output"
+  [[ -f "${DATA_DIR}/datasets/smoke/image.png" ]] || {
+    echo "missing real panorama: ${DATA_DIR}/datasets/smoke/image.png" >&2
+    exit 1
+  }
 }
 
 run_container() {
@@ -103,11 +96,11 @@ run_container() {
     -e "PATH_PIPELINES=/data/pipelines"
   )
 
-  if [[ -n "${TEST_RUNNER_MIN_SECONDS:-}" ]]; then
-    env_args+=(-e "TEST_RUNNER_MIN_SECONDS=${TEST_RUNNER_MIN_SECONDS}")
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    env_args+=(-e HF_TOKEN)
   fi
-  if [[ -n "${TEST_RUNNER_MAX_SECONDS:-}" ]]; then
-    env_args+=(-e "TEST_RUNNER_MAX_SECONDS=${TEST_RUNNER_MAX_SECONDS}")
+  if [[ -n "${RUNNER_ENV_FILE:-}" ]]; then
+    env_args+=(--env-file "${RUNNER_ENV_FILE}")
   fi
   if [[ -n "${RUNNER_LOG_LEVEL:-}" ]]; then
     env_args+=(-e "RUNNER_LOG_LEVEL=${RUNNER_LOG_LEVEL}")
@@ -115,6 +108,7 @@ run_container() {
 
   docker run -d \
     --name "${CONTAINER}" \
+    --gpus "${RUNNER_GPUS}" \
     -p "${HOST_PORT}:58090" \
     "${env_args[@]}" \
     -v "${DATA_DIR}:/data" \

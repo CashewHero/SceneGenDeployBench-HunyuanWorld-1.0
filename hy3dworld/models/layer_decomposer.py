@@ -33,7 +33,7 @@ class LayerDecomposition():
         self.ratio = 1.5
         self.grounding_model = "IDEA-Research/grounding-dino-tiny"
         self.zim_model_config = "vit_l"
-        self.zim_checkpoint = "./ZIM/zim_vit_l_2092"  # Add zim anything ckpt here
+        self.zim_checkpoint = os.getenv("HUNYUANWORLD_ZIM_CHECKPOINT", "./ZIM/zim_vit_l_2092")
         self.inpaint_model = "black-forest-labs/FLUX.1-Fill-dev"
         self.inpaint_fg_lora = "tencent/HunyuanWorld-1"
         self.inpaint_sky_lora = "tencent/HunyuanWorld-1"
@@ -60,27 +60,31 @@ class LayerDecomposition():
         # Load models
         print("=============  now loading models ===============")
         # super-resolution model
-        self.sr_model = sr_utils.build_sr_model(scale=self.scale, gpu_id=0)
+        self.sr_model = sr_utils.build_sr_model(
+            scale=self.scale, gpu_id=0, tile=getattr(args, "sr_tile", 0))
         print("=============  load Super-Resolution models done ")
         # segmentation model
-        self.zim_predictor = seg_utils.build_zim_model(
-            self.zim_model_config, self.zim_checkpoint, device='cuda:0')
-        self.gd_processor, self.gd_model = seg_utils.build_gd_model(
-            self.grounding_model, device='cuda:0')
+        needs_fg = bool(getattr(args, "labels_fg1", []) or getattr(args, "labels_fg2", []))
+        needs_sky = getattr(args, "classes", "outdoor") not in ("indoor", "[indoor]")
+        self.zim_predictor = self.gd_processor = self.gd_model = None
+        if needs_fg or needs_sky:
+            self.zim_predictor = seg_utils.build_zim_model(
+                self.zim_model_config, self.zim_checkpoint, device='cuda:0')
+            self.gd_processor, self.gd_model = seg_utils.build_gd_model(
+                self.grounding_model, device='cuda:0')
         print("=============  load Segmentation models done ====")
         # panorama inpaint model
-        self.inpaint_fg_model = inpaint_utils.build_inpaint_model(
-            self.inpaint_model,
-            self.inpaint_fg_lora,
-            subfolder="HunyuanWorld-PanoInpaint-Scene",
-            device=0
-        )
-        self.inpaint_sky_model = inpaint_utils.build_inpaint_model(
-            self.inpaint_model,
-            self.inpaint_sky_lora,
-            subfolder="HunyuanWorld-PanoInpaint-Sky",
-            device=0
-        )
+        # The existing layer pipelines skip empty foreground labels and indoor sky.
+        # Avoid loading their unused FLUX pipelines, especially on small GPUs.
+        self.inpaint_fg_model = self.inpaint_sky_model = None
+        for needed, attribute, subfolder in (
+            (needs_fg, "inpaint_fg_model", "HunyuanWorld-PanoInpaint-Scene"),
+            (needs_sky, "inpaint_sky_model", "HunyuanWorld-PanoInpaint-Sky"),
+        ):
+            if needed:
+                setattr(self, attribute, inpaint_utils.build_inpaint_model(
+                    self.inpaint_model, self.inpaint_fg_lora, subfolder=subfolder,
+                    device=0, offload_mode=getattr(args, "offload_mode", "model")))
         print("=============  load panorama inpaint models done =")
 
     def __call__(self, input, layer):
@@ -94,9 +98,6 @@ class LayerDecomposition():
             ValueError: If the input file is not a JSON file or if the layer index is invalid.
             TypeError: If the input is neither a string nor a list.
         """
-        torch.autocast(device_type=self.device,
-                       dtype=torch.bfloat16).__enter__()
-
         # Input handling and validation
         if isinstance(input, str):
             if not os.path.exists(input):
@@ -121,37 +122,26 @@ class LayerDecomposition():
             'dilation_size': self.dilation_size,
             'cfg_scale': self.cfg_scale,
             'prompt_config': self.prompt_config,
-            'cache': self.args.cache
+            'cache': self.args.cache,
+            'inference_steps': getattr(self.args, 'inference_steps', 50),
         }
 
-        # Layer-specific processing pipelines
-        if layer == 0:
-            layer_utils.remove_fg1_pipeline(
+        # Keep upstream BF16 autocast scoped to decomposition; do not leak it
+        # into the subsequent MoGe reconstruction or future calls.
+        use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16, enabled=use_bf16):
+            if layer == 0:
+                pipeline = layer_utils.remove_fg1_pipeline
+            elif layer == 1:
+                pipeline = layer_utils.remove_fg2_pipeline
+            else:
+                pipeline = layer_utils.sky_pipeline
+            pipeline(
                 img_infos=img_infos,
                 sr_model=self.sr_model,
                 zim_predictor=self.zim_predictor,
                 gd_processor=self.gd_processor,
                 gd_model=self.gd_model,
-                inpaint_model=self.inpaint_fg_model,
-                params=params
-            )
-        elif layer == 1:
-            layer_utils.remove_fg2_pipeline(
-                img_infos=img_infos,
-                sr_model=self.sr_model,
-                zim_predictor=self.zim_predictor,
-                gd_processor=self.gd_processor,
-                gd_model=self.gd_model,
-                inpaint_model=self.inpaint_fg_model,
-                params=params
-            )
-        else:
-            layer_utils.sky_pipeline(
-                img_infos=img_infos,
-                sr_model=self.sr_model,
-                zim_predictor=self.zim_predictor,
-                gd_processor=self.gd_processor,
-                gd_model=self.gd_model,
-                inpaint_model=self.inpaint_sky_model,
-                params=params
+                inpaint_model=self.inpaint_sky_model if layer == 2 else self.inpaint_fg_model,
+                params=params,
             )

@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import torch
 import utils3d
+import os
 from PIL import Image
 
 from moge.model.v1 import MoGeModel
@@ -46,7 +47,8 @@ def build_depth_model(device: torch.device = "cuda"):
         model (MoGeModel): The MoGe depth model instance.
     """
     # Load model from pretrained weights
-    model = MoGeModel.from_pretrained("Ruicheng/moge-vitl")
+    model = MoGeModel.from_pretrained(
+        "Ruicheng/moge-vitl", revision=os.getenv("HUNYUANWORLD_MOGE_REVISION"))
     model.eval()
     model = model.to(device)
     return model

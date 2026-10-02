@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import cv2
 import math
+import os
 from ..models import FluxFillPipeline
 
 
@@ -32,7 +33,7 @@ def get_smooth_mask(general_mask, ksize=(120, 120)):
     return mask_array
 
 
-def build_inpaint_model(model_path, lora_path, subfolder, device=0):
+def build_inpaint_model(model_path, lora_path, subfolder, device=0, offload_mode="model"):
     r"""Build the inpainting model pipeline.
     Args:
         model_path (str): The path to the pre-trained model.
@@ -43,17 +44,23 @@ def build_inpaint_model(model_path, lora_path, subfolder, device=0):
     """
     # Initialize pipeline with bfloat16 precision for memory efficiency
     pipe = FluxFillPipeline.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16)
+        model_path, torch_dtype=torch.bfloat16,
+        revision=os.getenv("HUNYUANWORLD_FLUX_REVISION"))
     pipe.load_lora_weights(
         lora_path,
         subfolder=subfolder,
+        revision=os.getenv("HUNYUANWORLD_LORA_REVISION"),
         weight_name="lora.safetensors",  # default weight name
         torch_dtype=torch.bfloat16
     )
     pipe.fuse_lora()
     pipe.unload_lora_weights()
     # save some VRAM by offloading the model to CPU
-    pipe.enable_model_cpu_offload()  # save some VRAM by offloading the model to CPU
+    if offload_mode == "sequential":
+        pipe.enable_sequential_cpu_offload(gpu_id=device)
+        pipe.vae.enable_tiling()
+    else:
+        pipe.enable_model_cpu_offload(gpu_id=device)
     pipe.device_id = device
     return pipe
 

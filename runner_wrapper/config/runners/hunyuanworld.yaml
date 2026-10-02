@@ -1,0 +1,44 @@
+catalog_version: 1
+
+runners:
+  - runner: hunyuanworld-panorama
+    version: 0.1.0
+    latest: true
+    display_name: HunyuanWorld 1.0 Panorama
+    kind: generator
+    contract_version: 1
+    inputs:
+      data:
+        required_sample:
+          required_datatype: [image]
+    job_parameters:
+      classes: outdoor
+      labels_fg1: []
+      labels_fg2: []
+      seed: 42
+      mesh_width: 3840
+      inference_steps: 50
+      sr_tile: 0
+      offload_mode: model
+      cache: false
+    scheduling:
+      # Sequential jobs in a batch. Each job has its own model child process.
+      max_batch_size: 4
+      max_attempts: 2
+      job_timeout_minutes: 240
+      startup_timeout_minutes: 5
+    launcher:
+      driver: docker
+      compat_version: 1
+      image: ghcr.io/cashewhero/scenegendeploybench-hunyuanworld-1.0:0.1.0
+      gpus: 1
+      endpoint:
+        port: 58090
+      env:
+        HF_HOME: /data/model_cache/hunyuanworld-1.0/huggingface
+        TORCH_HOME: /data/model_cache/hunyuanworld-1.0/torch
+        XDG_CACHE_HOME: /data/model_cache/hunyuanworld-1.0/xdg
+        HF_HUB_DISABLE_XET: "1"
+        OMP_NUM_THREADS: "8"
+        OPENBLAS_NUM_THREADS: "8"
+      env_passthrough: [HF_TOKEN]

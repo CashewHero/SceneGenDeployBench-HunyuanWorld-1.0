@@ -1,5 +1,7 @@
 [中文阅读](README_zh_cn.md)
 
+The DeployBench generator in [runner_wrapper](runner_wrapper/README.md) accepts a full equirectangular panorama and exports colored `mesh` and layered `scene` outputs using the upstream scene-generation flow.
+
 <p align="center">
   <img src="assets/teaser.png">
 </p>

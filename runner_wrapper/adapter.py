@@ -1,307 +1,309 @@
 from __future__ import annotations
 
-"""Default adapter implementation.
-
-Replace this file or point RUNNER_ADAPTER at a different callable inside the
-model repository.
-"""
-
+import fcntl
 import hashlib
 import json
-import logging
+import math
 import os
-import random
-import re
 import shutil
-import sys
 import time
 import traceback
+import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+from runner_wrapper.files import publish_file
 from runner_wrapper.job_logging import tee_job_output
 from runner_wrapper.measurements import ResourceMonitor
 
-logger = logging.getLogger("runner_wrapper.adapter")
+
+DEFAULT_PARAMETERS = {
+    "classes": "outdoor",
+    "labels_fg1": [],
+    "labels_fg2": [],
+    "seed": 42,
+    "mesh_width": 3840,
+    "inference_steps": 50,
+    "sr_tile": 0,
+    "offload_mode": "model",
+    "cache": False,
+}
+MODEL_REVISIONS = {
+    "HUNYUANWORLD_MOGE_REVISION": "ad326bfb61facd6c52b5a825bc1e34d7c97d9672",
+    "HUNYUANWORLD_GROUNDING_REVISION": "a2bb814dd30d776dcf7e30523b00659f4f141c71",
+    "HUNYUANWORLD_FLUX_REVISION": "358293da0354175698b67ec8299acf928313a78a",
+    "HUNYUANWORLD_LORA_REVISION": "43c47e7c5d7e5c6ac0f8410cb1df31a4af815d88",
+}
+ZIM_REVISION = "667e2d7c233f6f1cacd12ccc64bdf6cc7b5aa16d"
+SR_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
+# Upstream panorama rays point along -X at the image center, +Y to its right,
+# and +Z upward. The input viewpoint is the origin; depth has relative scale.
+OUTPUT_METADATA = {
+    "scene_coordinate_system": "BRU",
+    "scene_scale": 1.0,
+    "scene_units": "relative",
+    "scene_origin": "primary_viewpoint",
+}
 
 
-def event_message(event: str, **fields: object) -> str:
-    return json.dumps({"event": event, **fields}, sort_keys=True)
+def _parameters(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("job.parameters must be an object")
+    unknown = sorted(set(raw) - set(DEFAULT_PARAMETERS))
+    if unknown:
+        raise ValueError(f"unknown job parameters: {', '.join(unknown)}")
+    parameters = {**DEFAULT_PARAMETERS, **raw}
+    if parameters["classes"] not in ("indoor", "outdoor"):
+        raise ValueError("classes must be indoor or outdoor")
+    for key in ("labels_fg1", "labels_fg2"):
+        labels = parameters[key]
+        if not isinstance(labels, list) or any(
+            not isinstance(label, str) or not label.strip() for label in labels
+        ):
+            raise ValueError(f"{key} must be a list of nonempty label strings")
+    for key, lower, upper in (
+        ("seed", 0, 2**32 - 1),
+        ("mesh_width", 128, 3840),
+        ("inference_steps", 1, 50),
+        ("sr_tile", 0, 1024),
+    ):
+        value = parameters[key]
+        if type(value) is not int or not lower <= value <= upper:
+            raise ValueError(f"{key} must be an integer between {lower} and {upper}")
+    if parameters["mesh_width"] % 2:
+        raise ValueError("mesh_width must be even")
+    if parameters["offload_mode"] not in ("model", "sequential"):
+        raise ValueError("offload_mode must be model or sequential")
+    if type(parameters["cache"]) is not bool:
+        raise ValueError("cache must be boolean")
+    if parameters["cache"] and parameters["inference_steps"] != 50:
+        raise ValueError("upstream DeepCache requires inference_steps=50")
+    return parameters
 
 
-def _safe_role(role: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in role)
+def _prepare_input(request: dict[str, Any], destination: Path) -> tuple[str, Path]:
+    from PIL import Image
+
+    job = request["job"]
+    if job.get("job_type") not in ("generation", "generator"):
+        raise ValueError("HunyuanWorld accepts generation jobs only")
+    primary = job.get("primary_sample")
+    roles = request.get("inputs", {})
+    samples = roles.get("data", {})
+    if not isinstance(primary, str) or not primary or set(samples) != {primary}:
+        raise ValueError("inputs.data must contain exactly the primary sample")
+    if any(roles.get(role) for role in ("candidate", "references")):
+        raise ValueError("HunyuanWorld does not consume candidate or reference inputs")
+    source = samples[primary].get("image")
+    if not isinstance(source, str) or not Path(source).is_file():
+        raise ValueError("the primary image must be a readable file path")
+    metadata = job.get("primary_sample_metadata") or {}
+    if metadata.get("projection", "equirectangular") != "equirectangular":
+        raise ValueError("the input projection must be equirectangular")
+    fov = metadata.get("fov")
+    if fov is not None and (
+        not isinstance(fov, (list, tuple))
+        or len(fov) != 2
+        or any(type(value) not in (int, float) for value in fov)
+        or not math.isclose(fov[0], 360.0, abs_tol=1e-3)
+        or not math.isclose(fov[1], 180.0, abs_tol=1e-3)
+    ):
+        raise ValueError("the input must cover 360 by 180 degrees")
+    with Image.open(source) as image:
+        if image.width != 2 * image.height or image.height < 64:
+            raise ValueError("the input must be a full 2:1 panorama, at least 128x64")
+        image.convert("RGB").save(destination)
+    return primary, Path(source)
 
 
-def _safe_name(value: Any, fallback: str) -> str:
-    name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value or "").strip()).strip("-._")
-    return name or fallback
+def _configure_model_cache(parameters: dict[str, Any], workspace: Path) -> None:
+    root = Path(os.getenv("PATH_MODEL_CACHE", "/data/model_cache")) / "hunyuanworld-1.0"
+    root.mkdir(parents=True, exist_ok=True)
+    for key, suffix in (
+        ("HF_HOME", "huggingface"),
+        ("TORCH_HOME", "torch"),
+        ("XDG_CACHE_HOME", "xdg"),
+    ):
+        os.environ.setdefault(key, str(root / suffix))
+    os.environ.update(MODEL_REVISIONS)
+    # Set cache paths before importing Hugging Face, which reads them at import.
+    from huggingface_hub import hf_hub_download
 
-
-def _parameter_variant(parameters: Any) -> str:
-    if not isinstance(parameters, dict) or not parameters:
-        return "default"
-    encoded = json.dumps(
-        parameters,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    digest = hashlib.sha256(encoded).hexdigest()[:10]
-    readable = "variant"
-    for _, value in sorted(parameters.items()):
-        if isinstance(value, bool):
-            value = str(value).lower()
-        if isinstance(value, (str, int, float)):
-            readable = _safe_name(value, "variant")[:24]
-            break
-    return f"{readable}-{digest}"
-
-
-def _normalize_inputs(raw_inputs: Any) -> dict[str, dict[str, dict[str, Any]]]:
-    if raw_inputs is None:
-        return {}
-    if not isinstance(raw_inputs, dict):
-        raise ValueError("inputs must be an object")
-
-    normalized: dict[str, dict[str, dict[str, Any]]] = {}
-    for raw_role, raw_samples in raw_inputs.items():
-        role = str(raw_role).strip()
-        if not role or not isinstance(raw_samples, dict):
-            raise ValueError("each input role must contain a sample mapping")
-        samples: dict[str, dict[str, Any]] = {}
-        for raw_sample_id, raw_sample_data in raw_samples.items():
-            sample_id = str(raw_sample_id).strip()
-            if not sample_id or not isinstance(raw_sample_data, dict):
-                raise ValueError(f"inputs.{role} must map sample ids to data mappings")
-            sample_data: dict[str, Any] = {}
-            for raw_data_type, value in raw_sample_data.items():
-                data_type = str(raw_data_type).strip()
-                if not data_type:
-                    raise ValueError(f"inputs.{role}.{sample_id} contains an empty data type")
-                sample_data[data_type] = value.strip() if isinstance(value, str) else value
-            if sample_data:
-                samples[sample_id] = sample_data
-        if samples:
-            normalized[role] = samples
-    return normalized
-
-
-def _copy_inputs(
-    samples: dict[str, dict[str, Any]],
-    workspace_root: Path,
-    variant: str,
-) -> tuple[dict[str, dict[str, str]], int]:
-    output_files: dict[str, dict[str, str]] = {}
-    copied = 0
-    for sample_index, (sample_id, sample_data) in enumerate(samples.items()):
-        sample_outputs: dict[str, str] = {}
-        for data_index, (data_type, raw_path) in enumerate(sample_data.items()):
-            if not isinstance(raw_path, str):
-                continue
-            src_path = Path(raw_path)
-            if not src_path.exists() or not src_path.is_file():
-                raise FileNotFoundError(f"input file not found: {src_path}")
-            dst_name = (
-                f"input-{sample_index:02d}-{data_index:02d}-"
-                f"{_safe_role(sample_id)}-{_safe_role(data_type)}-"
-                f"{variant}{src_path.suffix}"
+    sr_path = root / "RealESRGAN_x2plus.pth"
+    with (root / ".sr.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not sr_path.is_file():
+            download = workspace / "RealESRGAN_x2plus.pth"
+            print("Downloading upstream Real-ESRGAN x2 weights", flush=True)
+            with (
+                urllib.request.urlopen(SR_URL, timeout=120) as response,
+                download.open("wb") as target,
+            ):
+                shutil.copyfileobj(response, target)
+            publish_file(download, sr_path)
+    os.environ["HUNYUANWORLD_SR_WEIGHTS"] = str(sr_path)
+    if (
+        parameters["labels_fg1"]
+        or parameters["labels_fg2"]
+        or parameters["classes"] == "outdoor"
+    ):
+        zim_dir = workspace / "zim_vit_l_2092"
+        zim_dir.mkdir()
+        for filename in ("encoder.onnx", "decoder.onnx"):
+            path = hf_hub_download(
+                "naver-iv/zim-anything-vitl",
+                f"zim_vit_l_2092/{filename}",
+                revision=ZIM_REVISION,
             )
-            dst_path = workspace_root / dst_name
-            shutil.copyfile(src_path, dst_path)
-            sample_outputs[data_type] = str(dst_path.relative_to(workspace_root))
-            copied += 1
-        if sample_outputs:
-            output_files[sample_id] = sample_outputs
-    return output_files, copied
+            (zim_dir / filename).symlink_to(path)
+        os.environ["HUNYUANWORLD_ZIM_CHECKPOINT"] = str(zim_dir)
 
 
-def _sleep_range_seconds() -> int:
-    min_seconds = int(os.getenv("TEST_RUNNER_MIN_SECONDS", "360"))
-    max_seconds = int(os.getenv("TEST_RUNNER_MAX_SECONDS", "720"))
-    if min_seconds < 0 or max_seconds < min_seconds:
-        raise ValueError("invalid TEST_RUNNER_MIN_SECONDS / TEST_RUNNER_MAX_SECONDS")
-    return random.randint(min_seconds, max_seconds)
+def _generate(image: Path, directory: Path, parameters: dict[str, Any]) -> Path:
+    import numpy as np
+    import open3d as o3d
+    import torch
+    from demo_scenegen import HYworldDemo
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("HunyuanWorld requires an NVIDIA CUDA GPU")
+    needs_inpaint = (
+        parameters["classes"] == "outdoor"
+        or parameters["labels_fg1"]
+        or parameters["labels_fg2"]
+    )
+    if needs_inpaint and torch.cuda.get_device_capability()[0] < 8:
+        raise RuntimeError(
+            "upstream FLUX inpainting requires a BF16-capable GPU; use an Ampere or newer GPU"
+        )
+    args = SimpleNamespace(
+        **parameters, fp8_attention=False, fp8_gemm=False, export_drc=False
+    )
+    demo = HYworldDemo(args, seed=parameters["seed"])
+    demo.run(
+        str(image),
+        parameters["labels_fg1"],
+        parameters["labels_fg2"],
+        classes=parameters["classes"],
+        output_dir=str(directory),
+        export_drc=False,
+    )
+    combined = o3d.geometry.TriangleMesh()
+    layers = []
+    for index, layer in enumerate(demo.hy3d_world.layered_world_mesh):
+        mesh = layer["mesh"]
+        if not mesh.has_triangles():
+            continue
+        vertices = np.asarray(mesh.vertices)
+        if not np.isfinite(vertices).all() or not mesh.has_vertex_colors():
+            raise RuntimeError("upstream produced an invalid or uncolored mesh")
+        combined += mesh
+        layers.append({"file": f"mesh_layer{index}.ply", "type": layer["type"]})
+    if not combined.has_triangles():
+        raise RuntimeError("upstream produced no mesh triangles")
+    destination = directory / "combined.ply"
+    if not o3d.io.write_triangle_mesh(str(destination), combined):
+        raise RuntimeError("could not export the combined mesh")
+    manifest = {
+        "layers": layers,
+        **OUTPUT_METADATA,
+        "vertex_count": len(combined.vertices),
+        "triangle_count": len(combined.triangles),
+    }
+    (directory / "layers.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return destination
 
 
-def _write_metrics_file(metrics_path: Path, summary: dict[str, Any]) -> None:
-    with metrics_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
-        handle.write("\n")
-
-
-def _is_evaluator_mode() -> bool:
-    runner_type = os.getenv("RUNNER_TYPE", "generator").strip().lower()
-    mode = os.getenv("TEST_RUNNER_MODE", "").strip().lower()
-    return runner_type == "evaluator" or mode == "evaluator"
-
-
-def _random_evaluation_metrics() -> list[dict[str, Any]]:
-    return [
-        {
-            "namespace": "quality",
-            "name": "test_quality_score",
-            "type": "float",
-            "value": round(random.uniform(0.0, 1.0), 6),
-            "unit": "score",
-            "source": "evaluator",
-        },
-        {
-            "namespace": "quality",
-            "name": "test_geometry_error",
-            "type": "float",
-            "value": round(random.uniform(0.0, 0.25), 6),
-            "unit": "normalized_error",
-            "source": "evaluator",
-        },
-    ]
-
-
-def run_job(job_request: dict[str, Any]) -> dict[str, Any]:
-    started_at = time.time()
-    runtime = job_request["runtime"]
-    workspace_root = Path(runtime["workspace_dir"])
-    workspace_root.mkdir(parents=True, exist_ok=True)
-    parameters = job_request.get("job", {}).get("parameters") or {}
-    variant = _parameter_variant(parameters)
-    log_path = workspace_root / f"runner-{variant}.log"
+def run_job(request: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
+    workspace = Path(request["runtime"]["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    raw = request.get("job", {}).get("parameters") or {}
+    digest = hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest()[:10]
+    variant = f"scene-{digest}"
+    log_path = workspace / f"runner-{variant}.log"
+    monitor = None
     with tee_job_output(log_path):
-        return _run_job_logged(
-            job_request,
-            started_at,
-            workspace_root,
-            log_path,
-            variant,
-        )
-
-
-def _run_job_logged(
-    job_request: dict[str, Any],
-    started_at: float,
-    workspace_root: Path,
-    log_path: Path,
-    variant: str,
-) -> dict[str, Any]:
-    monitor: ResourceMonitor | None = None
-
-    try:
-        job = job_request["job"]
-        runtime = job_request["runtime"]
-        inputs = _normalize_inputs(job_request.get("inputs"))
-        data_samples = inputs.get("data", {})
-        monitor_data = {
-            f"{role}.{sample_id}.{data_type}": value
-            for role, samples in inputs.items()
-            for sample_id, sample_data in samples.items()
-            for data_type, value in sample_data.items()
-        }
-        monitor = ResourceMonitor(sample_data=monitor_data, output_dir=workspace_root)
-        monitor.start()
-        logger.info(
-            event_message(
-                "adapter_run_started",
-                job_id=job["job_id"],
-                batch_id=job.get("batch_id"),
-                workspace_dir=runtime["workspace_dir"],
-                input_roles=sorted(inputs),
+        try:
+            parameters = _parameters(raw)
+            image = workspace / "input.png"
+            primary, source = _prepare_input(request, image)
+            monitor = ResourceMonitor(
+                sample_data={"image": str(source)}, output_dir=workspace
             )
-        )
-
-        metrics_path = workspace_root / f"metrics-{variant}.json"
-        print(f"test runner job {job['job_id']} started", flush=True)
-
-        sleep_seconds = _sleep_range_seconds()
-        logger.info(event_message("adapter_sleeping", job_id=job["job_id"], sleep_seconds=sleep_seconds))
-        print(f"test runner sleeping for {sleep_seconds} seconds", flush=True)
-
-        time.sleep(sleep_seconds)
-        evaluator_mode = _is_evaluator_mode()
-        output_files: dict[str, dict[str, str]] = {}
-        copied_input_count = 0
-        if not evaluator_mode:
-            print("test runner copying data inputs", flush=True)
-            output_files, copied_input_count = _copy_inputs(
-                data_samples,
-                workspace_root,
-                variant,
-            )
-        logger.info(
-            event_message(
-                "adapter_inputs_copied",
-                job_id=job["job_id"],
-                copied_input_count=copied_input_count,
-            )
-        )
-
-        evaluation_metrics = _random_evaluation_metrics() if evaluator_mode else []
-
-        resource_metrics = monitor.stop()
-        monitor = None
-        metrics = resource_metrics + evaluation_metrics
-        completed_at = time.time()
-        wall_time_ms = round((completed_at - started_at) * 1000, 3)
-        print(f"test runner copied {copied_input_count} output files", flush=True)
-        print(f"test runner completed in {wall_time_ms} ms", flush=True)
-        report: dict[str, Any] = {"inputs": inputs}
-        if output_files:
-            report["output_files"] = output_files
-        if job.get("parameters"):
-            report["parameters"] = dict(job["parameters"])
-        if evaluation_metrics:
-            report["metrics"] = evaluation_metrics
-        if resource_metrics:
-            report["resource_metrics"] = resource_metrics
-        _write_metrics_file(metrics_path, report)
-
-        logger.info(
-            event_message(
-                "adapter_run_completed",
-                job_id=job["job_id"],
-                wall_time_ms=wall_time_ms,
-                copied_input_count=copied_input_count,
-            )
-        )
-
-        result = {
-            "status": "completed",
-            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at)),
-            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(completed_at)),
-            "metrics": metrics,
-            "artifacts": [
-                {
-                    "artifact_type": "job_log",
-                    "path": log_path.name,
+            monitor.start()
+            _configure_model_cache(parameters, workspace)
+            directory = workspace / "reconstruction"
+            directory.mkdir()
+            print(f"Running upstream HYworldDemo with {parameters}", flush=True)
+            generated = _generate(image, directory, parameters)
+            mesh_name = f"mesh-{variant}.ply"
+            generated.rename(workspace / mesh_name)
+            # Publish original layers, without intermediate masks or model inputs.
+            scene_name = f"layers-{variant}"
+            scene_dir = workspace / scene_name
+            scene_dir.mkdir()
+            layer_info = json.loads((directory / "layers.json").read_text())
+            for layer in layer_info["layers"]:
+                (directory / layer["file"]).rename(scene_dir / layer["file"])
+            (directory / "layers.json").rename(scene_dir / "layers.json")
+            outputs = {primary: {"mesh": mesh_name, "scene": scene_name}}
+            metrics = monitor.stop()
+            monitor = None
+            for name in ("vertex_count", "triangle_count"):
+                if name in layer_info:
+                    metrics.append(
+                        {
+                            "namespace": "model",
+                            "name": name,
+                            "type": "integer",
+                            "value": layer_info[name],
+                            "source": "model",
+                        }
+                    )
+            report_name = f"metrics-{variant}.json"
+            report = {
+                "inputs": request["inputs"],
+                "output_files": outputs,
+                "parameters": parameters,
+                "output_metadata": OUTPUT_METADATA,
+                "resource_metrics": metrics,
+            }
+            (workspace / report_name).write_text(json.dumps(report, indent=2) + "\n")
+            return {
+                "status": "completed",
+                "started_at": _timestamp(started),
+                "completed_at": _timestamp(time.time()),
+                "output_files": outputs,
+                "output_metadata": OUTPUT_METADATA,
+                "metrics": metrics,
+                "artifacts": [
+                    {"artifact_type": "job_log", "path": log_path.name},
+                    {"artifact_type": "metric_summary", "path": report_name},
+                ],
+                "failure": None,
+            }
+        except Exception as exc:
+            traceback.print_exc()
+            return {
+                "status": "failed",
+                "started_at": _timestamp(started),
+                "completed_at": _timestamp(time.time()),
+                "metrics": monitor.stop() if monitor else [],
+                "artifacts": [{"artifact_type": "job_log", "path": log_path.name}],
+                "failure": {
+                    "code": "INVALID_INPUT"
+                    if isinstance(exc, ValueError)
+                    else "MODEL_ERROR",
+                    "message": str(exc),
+                    "retryable": isinstance(exc, (OSError, TimeoutError)),
+                    "stage": "adapter",
                 },
-                {
-                    "artifact_type": "metric_summary",
-                    "path": metrics_path.name,
-                },
-            ],
-            "failure": None,
-        }
-        if output_files:
-            result["output_files"] = output_files
-        return result
-    except Exception as exc:
-        resource_metrics = monitor.stop() if monitor is not None else []
-        completed_at = time.time()
-        print(f"test runner job failed: {exc}", file=sys.stderr, flush=True)
-        traceback.print_exc()
-        return {
-            "status": "failed",
-            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at)),
-            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(completed_at)),
-            "metrics": resource_metrics,
-            "artifacts": [
-                {
-                    "artifact_type": "job_log",
-                    "path": log_path.name,
-                }
-            ],
-            "failure": {
-                "code": "TEST_RUNNER_FAILED",
-                "message": f"Test runner failed; see {log_path.name}",
-                "retryable": False,
-                "stage": "adapter",
-            },
-        }
+            }
+
+
+def _timestamp(value: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
