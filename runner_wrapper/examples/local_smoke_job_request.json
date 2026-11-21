@@ -11,5 +11,5 @@
     "parameters": {"classes": "indoor", "mesh_width": 960, "sr_tile": 256}
   },
   "inputs": {"data": {"sample-1": {"image": "/data/datasets/smoke/image.png"}}},
-  "runtime": {"output_dir": "/data/output/hunyuanworld-panorama@0.1.0/smoke/sample-1"}
+  "runtime": {"output_dir": "/data/output/hunyuanworld-panorama@0.1.1/smoke/sample-1"}
 }

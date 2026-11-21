@@ -2,7 +2,7 @@ catalog_version: 1
 
 runners:
   - runner: hunyuanworld-panorama
-    version: 0.1.0
+    version: 0.1.1
     latest: true
     display_name: HunyuanWorld 1.0 Panorama
     kind: generator
@@ -30,7 +30,7 @@ runners:
     launcher:
       driver: docker
       compat_version: 1
-      image: ghcr.io/cashewhero/scenegendeploybench-hunyuanworld-1.0:0.1.0
+      image: ghcr.io/cashewhero/scenegendeploybench-hunyuanworld-1.0:0.1.1
       gpus: 1
       endpoint:
         port: 58090

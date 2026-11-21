@@ -90,6 +90,7 @@ class HunyuanWorldAdapterTests(unittest.TestCase):
                 {"mesh_layer0.ply", "layers.json"},
             )
             self.assertEqual(result["output_metadata"], OUTPUT_METADATA)
+            self.assertEqual(result["output_metadata"]["scene_scale"], 0.244)
             summary = next(
                 artifact
                 for artifact in result["artifacts"]
@@ -97,6 +98,7 @@ class HunyuanWorldAdapterTests(unittest.TestCase):
             )
             report = json.loads((root / "workspace" / summary["path"]).read_text())
             self.assertEqual(report["output_files"], result["output_files"])
+            self.assertEqual(report["output_metadata"], result["output_metadata"])
 
     def test_failures_keep_log(self):
         with tempfile.TemporaryDirectory() as temporary:

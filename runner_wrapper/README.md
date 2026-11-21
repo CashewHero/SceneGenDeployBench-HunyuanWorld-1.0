@@ -1,8 +1,12 @@
 # HunyuanWorld 1.0 runner
 
-`hunyuanworld-panorama` is a generator. It accepts one full 2:1 equirectangular `image`, uses `demo_scenegen.HYworldDemo`, and returns a colored PLY `mesh` plus a `scene` directory containing the original mesh layers and their manifest. It does not generate a replacement panorama. The scene origin is the primary viewpoint, coordinate system is `BRU`, and scale is relative. No benchmark scale calibration has been applied.
+`hunyuanworld-panorama` accepts one full 2:1 equirectangular `image`, uses `demo_scenegen.HYworldDemo`, and returns a colored PLY `mesh` plus a `scene` directory containing the original mesh layers and their manifest. The scene uses `BRU` coordinates and relative units, with the primary viewpoint as origin.
 
 The adaptation follows upstream layer decomposition, Real-ESRGAN super-resolution, MoGe panorama depth, adaptive depth compression, and mesh construction. Defaults match the scene demo: outdoor scene, empty foreground labels, 3840x1920 mesh resolution, 50 inpainting steps, BF16 FLUX Fill, and model CPU offloading. Upstream uses one GPU; this runner does too.
+
+## Scene scale
+
+The runner reports `scene_scale: 0.244` in its output metadata and layer manifest. This is the rounded median of the per-trajectory depth calibration scales for the default generation settings on `tartanair-pano-test`. All 100 trajectories converged, and the middle 50% of scales ranged from about 0.14 to 0.64. Renderers multiply dataset camera displacement by this scale in the exported mesh's relative coordinates.
 
 ## Parameters
 
@@ -41,7 +45,7 @@ runner_wrapper/localtest.sh smoke
 
 ## Deployment
 
-Copy [hunyuanworld.yaml](config/runners/hunyuanworld.yaml) into the deployment's runner catalog, preserving deployment-specific GPU selection and scheduling. The release image is `ghcr.io/cashewhero/scenegendeploybench-hunyuanworld-1.0:0.1.0`. The repository name must start with `SceneGenDeployBench-`; the workflow derives its GHCR name from it.
+Copy [hunyuanworld.yaml](config/runners/hunyuanworld.yaml) into the deployment's runner catalog, preserving deployment-specific GPU selection and scheduling. The catalog specifies the release image. The image workflow uses the repository name, which must start with `SceneGenDeployBench-`.
 
 The existing `render_3dgs_preview` pipeline requires `3dgs`, so it cannot consume this runner's `mesh` output. Use a mesh renderer and matching preview pipeline. Converting the output to splats would add a reconstruction step that upstream does not provide.
 

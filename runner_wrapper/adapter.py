@@ -41,7 +41,7 @@ SR_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealES
 # and +Z upward. The input viewpoint is the origin; depth has relative scale.
 OUTPUT_METADATA = {
     "scene_coordinate_system": "BRU",
-    "scene_scale": 1.0,
+    "scene_scale": 0.244,
     "scene_units": "relative",
     "scene_origin": "primary_viewpoint",
 }
